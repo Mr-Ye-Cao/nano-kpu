@@ -6,6 +6,8 @@
 #   2. create a DEDICATED conda env `nano-kpu` with verilator / yosys /
 #      python=3.12 / numpy from conda-forge — never installs into an
 #      existing base env (shared base envs are routinely broken)
+#      On Apple Silicon, where conda-forge does not publish yosys, install
+#      or reuse Homebrew yosys while keeping verilator/python in conda.
 #   3. write scripts/kpu-env.sh (generated) which puts the env on PATH
 #   4. download the Nangate45 liberty (pinned by commit + sha256; not
 #      bundled for license reasons)
@@ -20,14 +22,30 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 ENV_NAME="nano-kpu"
+OS="$(uname -s)"
+ARCH="$(uname -m)"
 LIB_URL="https://raw.githubusercontent.com/The-OpenROAD-Project/OpenROAD-flow-scripts/19c2b08c4caa7d5fae6fecd81415e808f7a92b83/flow/platforms/nangate45/lib/NangateOpenCellLibrary_typical.lib"
 LIB_DEST="harness/lib/NangateOpenCellLibrary_typical.lib"
 LIB_SHA256="8d540a4d4cf6d09d27c87ad067857a9c0c2eeb023ab7a56e058cd3113db4e9b1"
 
-MINICONDA_URLS=(
-    "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
-    "https://mirrors.aliyun.com/anaconda/miniconda/Miniconda3-latest-Linux-x86_64.sh"
-)
+MINICONDA_URLS=()
+case "$OS/$ARCH" in
+    Darwin/arm64)
+        MINICONDA_URLS+=("https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-arm64.sh")
+        ;;
+    Darwin/x86_64)
+        MINICONDA_URLS+=("https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-x86_64.sh")
+        ;;
+    Linux/aarch64)
+        MINICONDA_URLS+=("https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-aarch64.sh")
+        ;;
+    Linux/x86_64)
+        MINICONDA_URLS+=(
+            "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
+            "https://mirrors.aliyun.com/anaconda/miniconda/Miniconda3-latest-Linux-x86_64.sh"
+        )
+        ;;
+esac
 
 FAILURES=()
 pass() { printf '  [ OK ] %s\n' "$1"; }
@@ -43,6 +61,7 @@ sha256_of() {
 
 echo "== nano-kpu environment setup (conda-centric) =="
 echo "repo root: $ROOT"
+echo "platform: $OS/$ARCH"
 echo
 
 # ---------------------------------------------------------------- 1. conda
@@ -54,43 +73,86 @@ elif [ -x "$HOME/miniconda3/bin/conda" ]; then
     CONDA="$HOME/miniconda3/bin/conda"
 fi
 if [ -z "$CONDA" ]; then
-    info "conda not found — bootstrapping Miniconda into ~/miniconda3"
-    INST="$(mktemp /tmp/miniconda-installer.XXXXXX.sh)"
-    GOT=0
-    for url in "${MINICONDA_URLS[@]}"; do
-        info "trying $url"
-        if curl -fSL --connect-timeout 20 -o "$INST" "$url"; then GOT=1; break; fi
-    done
-    if [ "$GOT" = "1" ] && bash "$INST" -b -p "$HOME/miniconda3" >>/tmp/miniconda-install.log 2>&1; then
-        CONDA="$HOME/miniconda3/bin/conda"
-        pass "Miniconda installed to ~/miniconda3 (log: /tmp/miniconda-install.log)"
+    if [ ${#MINICONDA_URLS[@]} -eq 0 ]; then
+        fail "unsupported platform $OS/$ARCH — install conda manually"
     else
-        rm -f "$INST"
-        fail "could not bootstrap Miniconda — install conda manually (https://docs.conda.io/en/latest/miniconda.html) and re-run"
+        info "conda not found — bootstrapping Miniconda into ~/miniconda3"
+        INST="$(mktemp /tmp/miniconda-installer.XXXXXX.sh)"
+        GOT=0
+        for url in "${MINICONDA_URLS[@]}"; do
+            info "trying $url"
+            if curl -fSL --connect-timeout 20 -o "$INST" "$url"; then GOT=1; break; fi
+        done
+        if [ "$GOT" = "1" ] && bash "$INST" -b -p "$HOME/miniconda3" >>/tmp/miniconda-install.log 2>&1; then
+            CONDA="$HOME/miniconda3/bin/conda"
+            pass "Miniconda installed to ~/miniconda3 (log: /tmp/miniconda-install.log)"
+        else
+            rm -f "$INST"
+            fail "could not bootstrap Miniconda — install conda manually (https://docs.conda.io/en/latest/miniconda.html) and re-run"
+        fi
     fi
 else
     pass "conda found: $CONDA"
 fi
 
 # ---------------------------------------------------------------- 2. dedicated env
-echo "-- conda env '$ENV_NAME' (verilator 5.x, yosys >= 0.64, python 3.12 + numpy)"
+CONDA_PACKAGES=(verilator=5 python=3.12 numpy)
+CONDA_PROVIDES_YOSYS=1
+if [ "$OS" = "Darwin" ] && [ "$ARCH" = "arm64" ]; then
+    CONDA_PROVIDES_YOSYS=0
+else
+    CONDA_PACKAGES+=(yosys)
+fi
+
+echo "-- conda env '$ENV_NAME' (verilator 5.x, python 3.12 + numpy)"
 ENV_BIN=""
 if [ -n "$CONDA" ]; then
     BASE="$("$CONDA" info --base 2>/dev/null)"
     ENV_BIN="$BASE/envs/$ENV_NAME/bin"
-    if [ ! -x "$ENV_BIN/verilator" ] || [ ! -x "$ENV_BIN/yosys" ] \
-        || ! "$ENV_BIN/python3" -c "import numpy" >/dev/null 2>&1; then
+    ENV_NEEDS_UPDATE=0
+    [ -x "$ENV_BIN/verilator" ] || ENV_NEEDS_UPDATE=1
+    [ -x "$ENV_BIN/python3" ] || ENV_NEEDS_UPDATE=1
+    if [ -x "$ENV_BIN/python3" ] \
+        && ! "$ENV_BIN/python3" -c "import numpy" >/dev/null 2>&1; then
+        ENV_NEEDS_UPDATE=1
+    fi
+    if [ "$CONDA_PROVIDES_YOSYS" = "1" ] && [ ! -x "$ENV_BIN/yosys" ]; then
+        ENV_NEEDS_UPDATE=1
+    fi
+    if [ "$ENV_NEEDS_UPDATE" = "1" ]; then
         info "creating/updating env '$ENV_NAME' from conda-forge (a few minutes)"
         if "$CONDA" create -y -n "$ENV_NAME" --override-channels -c conda-forge \
-                verilator yosys python=3.12 numpy >>/tmp/nano-kpu-conda-create.log 2>&1 \
+                "${CONDA_PACKAGES[@]}" >>/tmp/nano-kpu-conda-create.log 2>&1 \
            || "$CONDA" install -y -n "$ENV_NAME" --override-channels -c conda-forge \
-                verilator yosys python=3.12 numpy >>/tmp/nano-kpu-conda-create.log 2>&1; then
+                "${CONDA_PACKAGES[@]}" >>/tmp/nano-kpu-conda-create.log 2>&1; then
             pass "env '$ENV_NAME' ready (log: /tmp/nano-kpu-conda-create.log)"
         else
             fail "conda env creation failed — see /tmp/nano-kpu-conda-create.log"
         fi
     else
         pass "env '$ENV_NAME' already present"
+    fi
+fi
+
+# conda-forge has no native osx-arm64 yosys build. Prefer an existing yosys,
+# then use Homebrew on Apple Silicon so the rest of the toolchain stays native.
+YOSYS_BIN=""
+if [ -n "$ENV_BIN" ] && [ -x "$ENV_BIN/yosys" ]; then
+    YOSYS_BIN="$ENV_BIN/yosys"
+elif have yosys; then
+    YOSYS_BIN="$(command -v yosys)"
+elif [ "$OS" = "Darwin" ] && [ "$ARCH" = "arm64" ]; then
+    echo "-- Homebrew yosys (required on Apple Silicon)"
+    if have brew; then
+        info "yosys not found — installing it with Homebrew"
+        if brew install yosys >>/tmp/nano-kpu-brew-yosys.log 2>&1; then
+            YOSYS_BIN="$(command -v yosys || true)"
+            pass "Homebrew yosys installed (log: /tmp/nano-kpu-brew-yosys.log)"
+        else
+            fail "Homebrew yosys install failed — see /tmp/nano-kpu-brew-yosys.log"
+        fi
+    else
+        fail "yosys is unavailable — install Homebrew, then run: brew install yosys"
     fi
 fi
 
@@ -102,19 +164,20 @@ check_verilator() {
     ver="$(awk '{print $2}' <<<"$out")"; major="${ver%%.*}"
     printf '  expected vs found: verilator 5.x vs %s\n' "$ver"
     [ "$major" = "5" ] && { pass "verilator $ver"; return 0; }
-    fail "verilator major must be 5.x (found $ver)"
+    return 1
 }
 check_yosys() {
-    [ -n "$ENV_BIN" ] && [ -x "$ENV_BIN/yosys" ] || return 1
+    [ -n "$YOSYS_BIN" ] && [ -x "$YOSYS_BIN" ] || return 1
     local out ver maj min
-    out="$("$ENV_BIN/yosys" -V 2>/dev/null | head -n1)" || return 1
+    out="$("$YOSYS_BIN" -V 2>/dev/null | head -n1)" || return 1
     ver="$(awk '{print $2}' <<<"$out")"
     maj="${ver%%.*}"; min="${ver#*.}"; min="${min%%.*}"; min="${min%%+*}"
     printf '  expected vs found: yosys >= 0.64 vs %s\n' "$ver"
     if [ "$maj" -gt 0 ] 2>/dev/null || { [ "$maj" = "0" ] && [ "$min" -ge 64 ] 2>/dev/null; }; then
         pass "yosys $ver"
+        return 0
     else
-        fail "yosys >= 0.64 required (found $ver)"
+        return 1
     fi
 }
 check_numpy() {
@@ -132,10 +195,14 @@ echo
 
 # ---------------------------------------------------------------- 3. kpu-env.sh
 if [ -n "$ENV_BIN" ] && [ -d "$ENV_BIN" ]; then
+    TOOL_PATH="$ENV_BIN"
+    if [ -n "$YOSYS_BIN" ] && [ "$(dirname "$YOSYS_BIN")" != "$ENV_BIN" ]; then
+        TOOL_PATH="$TOOL_PATH:$(dirname "$YOSYS_BIN")"
+    fi
     cat > scripts/kpu-env.sh <<EOF
 # generated by scripts/setup_env.sh — source to put the '$ENV_NAME'
 # toolchain env on PATH (verilator / yosys / python3+numpy).
-export PATH="$ENV_BIN:\$PATH"
+export PATH="$TOOL_PATH:\$PATH"
 EOF
     pass "scripts/kpu-env.sh written — run: source scripts/kpu-env.sh"
 fi
